@@ -2,426 +2,256 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## System Architecture Overview
+## System Overview
 
-### PROFESSIONAL ARCHITECTURE: External Media with RTP (Production Ready)
+This is a multi-component Voice AI telephony system that enables AI-powered phone conversations. The system uses Asterisk PBX for telephony, integrates with Azure and Mistral AI for speech and conversation services, and provides real-time voice interactions through RTP streaming.
 
-```
-┌─────────────┐     SIP (Signaling)     ┌──────────────┐     HTTP API      ┌─────────────┐
-│  Placetel   │ ←──────────────────────→ │  Asterisk 22 │ ←───────────────→ │  Voice AI   │
-│   Trunk     │                          │    (PJSIP)   │                   │  HTTP:8080  │
-└─────────────┘                          └──────────────┘                   └─────────────┘
-      ↓                                        ↓                                   ↓
-   RTP Audio                            ExternalMedia()                      RTP Server
-      ↓                                        ↓                                   ↓
-┌─────────────┐     RTP (Audio Stream)  ┌──────────────┐                   ┌─────────────┐
-│  Placetel   │ ←──────────────────────→│  RTP Server  │                   │  Voice AI   │
-│  RTP:10000  │     Bidirectional        │  UDP:10000   │                   │  Processing │
-└─────────────┘     G.711 μ-law/A-law   └──────────────┘                   └─────────────┘
-```
+## Architecture Components
 
-**Why External Media RTP is Professional:**
-- Used by Twilio, Vonage, Amazon Connect, Google Cloud
-- Direct RTP stream - no TCP overhead
-- Full control over jitter buffer and timing
-- Supports DTMF, comfort noise, packet loss concealment
-- Scales to thousands of concurrent calls
-- True bidirectional real-time audio
+### Core Services
+- **Asterisk PBX** (Server 6): Handles SIP telephony with Placetel trunk
+- **ARI-Bridge** (Server 6): Manages External Media channels via Asterisk REST Interface
+- **Voice AI Core** (Server 7): Processes audio streams, STT/TTS, and AI conversations
+- **Teli24 Middleware** (Server 7): FastAPI service bridging frontend with backend services
+- **PostgreSQL Database** (Server 5): Stores assistant configs, call records, and transcripts
 
-### OLD ARCHITECTURE (Deprecated): AudioSocket
-```
-Problems with AudioSocket:
-- Experimental/unstable
-- TCP-based (adds latency)
-- Connection drops after 2-3 responses
-- No production deployments
-- Not suitable for bidirectional communication
-```
-
-## Core Implementation
-
-### Current: External Media RTP Architecture
-
-The system uses Asterisk's ExternalMedia application to establish direct RTP streams between the caller and our Voice AI server. This is the same architecture used by major cloud providers.
-
-**Components:**
-1. **RTP Server** (`rtp_voice_ai.py`): Handles bidirectional RTP audio streams
-2. **HTTP API**: Receives External Media requests from Asterisk
-3. **Codec Support**: G.711 μ-law/A-law (standard telephony)
-4. **Port Range**: UDP 10000-20000 for RTP
-
-### Key Components
-
-1. **Asterisk Configuration** (`/etc/asterisk/`)
-   - `pjsip.conf`: SIP trunk registration with Placetel (777z5laknf@fpbx.de)
-   - `extensions_voice_ai.conf`: Dialplan routing calls to AudioSocket
-   - Phone numbers: 4920189098720-723 routed to AudioSocket on port 9092
-
-2. **Voice AI Implementations** (`/home/admini/asterisk-voice-ai/`)
-   - **`rtp_voice_ai.py`**: PRODUCTION - External Media RTP server (recommended)
-   - **`ari_voice_ai.py`**: Alternative using Asterisk REST Interface
-   - Legacy AudioSocket attempts (deprecated):
-     - `fast_voice_ai.py`: Had connection stability issues
-     - `stable_voice_ai.py`: Workarounds for AudioSocket problems
-     - Various other attempts to fix AudioSocket (not production ready)
-
-3. **Database Integration**
-   - PostgreSQL on 10.0.0.5 (teli24_development)
-   - Assistant configurations with greetings and system prompts
-   - Phone number to assistant mapping
+### Key Technologies
+- **Language**: Python 3.12+
+- **Telephony**: Asterisk 22 LTS with ARI (Asterisk REST Interface)
+- **Audio**: RTP/RTCP for real-time audio streaming
+- **AI Services**: Azure Speech Services, Mistral AI, OpenAI GPT
+- **Framework**: FastAPI for middleware, asyncio for concurrent operations
+- **Database**: PostgreSQL with asyncpg
 
 ## Common Development Commands
 
-### Starting the RTP Voice AI Server (PRODUCTION)
-```bash
-# Kill any existing processes
-pkill -f "voice_ai.py" || true
+### Starting Services
 
-# Start RTP server
+```bash
+# Start Voice AI Core (Production)
 cd /home/admini/asterisk-voice-ai
-DB_PASSWORD='BlLNl1jMWpZC9_td5bFVUKgAvtI3LQkW' ./venv/bin/python rtp_voice_ai.py
+DB_PASSWORD='BlLNl1jMWpZC9_td5bFVUKgAvtI3LQkW' ./venv/bin/python ari_snoop_final.py
 
-# Or run in background
-DB_PASSWORD='BlLNl1jMWpZC9_td5bFVUKgAvtI3LQkW' nohup ./venv/bin/python rtp_voice_ai.py > rtp_voice.log 2>&1 &
+# Start Teli24 Middleware
+cd /home/admini/archivalles/teli24-middleware
+source venv/bin/activate
+uvicorn app.main:app --reload --host 0.0.0.0 --port 8080
 
-# Monitor RTP traffic
-sudo tcpdump -i any -n udp port 10000 -v
-```
+# Monitor Asterisk
+asterisk -rvvv
 
-### Configuring Asterisk for External Media
-```ini
-; In extensions.conf or extensions_rtp.conf
-exten => 4920189098723,1,NoOp(RTP Voice AI)
- same => n,Answer()
- same => n,ExternalMedia(channel,${CHANNEL},http://127.0.0.1:8080/externalmedia)
- same => n,Hangup()
-```
-
-### Testing Calls
-```bash
 # Check SIP registration
 asterisk -rx "pjsip show registrations"
 
-# Make test call
+# Check active channels
+asterisk -rx "core show channels"
+```
+
+### Testing & Debugging
+
+```bash
+# Test call to Voice AI
 asterisk -rx "channel originate PJSIP/4920189098723@fpbx application Playback hello-world"
 
-# Monitor Asterisk console
-asterisk -rvvv
+# Monitor RTP traffic
+sudo tcpdump -i any -n udp portrange 15000-16000 -v
 
-# Watch SIP traffic
-sudo tcpdump -i any -n port 5060 -v
-```
-
-### Database Queries
-```bash
-# Check assistant configuration
-PGPASSWORD='BlLNl1jMWpZC9_td5bFVUKgAvtI3LQkW' psql -U teli24_user -h 10.0.0.5 -d teli24_development -c "
-  SELECT a.name, a.greeting, p.number 
-  FROM \"Assistant\" a 
-  JOIN \"PhoneNumber\" p ON a.id = p.\"assignedToAssistantId\" 
-  WHERE p.number LIKE '%4920189098723%'
-"
-```
-
-### Debugging
-```bash
 # Check Voice AI logs
-tail -f /home/admini/asterisk-voice-ai/voice_ai.log
+tail -f /home/admini/asterisk-voice-ai/ari_final.log
 
-# Asterisk logs
-sudo tail -f /var/log/asterisk/messages.log
+# Database queries
+PGPASSWORD='BlLNl1jMWpZC9_td5bFVUKgAvtI3LQkW' psql -U teli24_user -h 10.0.0.5 -d teli24_development
 
-# Check if AudioSocket is listening
-ss -tlnp | grep 9092
+# Check call records
+PGPASSWORD='BlLNl1jMWpZC9_td5bFVUKgAvtI3LQkW' psql -U teli24_user -h 10.0.0.5 -d teli24_development -c "SELECT * FROM \"CallRecord\" ORDER BY \"startTime\" DESC LIMIT 5;"
 ```
 
-## RTP Protocol Implementation
+### Process Management
 
-### RTP Packet Structure
-```python
-# RTP Header (12 bytes)
-0                   1                   2                   3
-0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|V=2|P|X|  CC   |M|     PT      |       sequence number         |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                           timestamp                           |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|           synchronization source (SSRC) identifier            |
-+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+=+
-```
-
-### Codec Support
-- **G.711 μ-law** (PT=0): North America, Japan
-- **G.711 A-law** (PT=8): Europe
-- **Packet size**: 160 bytes (20ms at 8kHz)
-- **Sample rate**: 8000 Hz
-- **Bit depth**: 8-bit (compressed from 16-bit)
-
-### Port Configuration
 ```bash
-# RTP uses even ports, RTCP uses odd ports
-RTP_PORT=10000   # Audio stream
-RTCP_PORT=10001  # Control (optional)
-HTTP_PORT=8080   # External Media API
+# Find and kill processes
+pgrep -f "ari_snoop_final.py"
+pkill -f "ari_snoop_final.py"
+
+# Check port usage
+ss -tlnp | grep -E "8080|8088|5060"
+lsof -i :8080
+
+# Service management
+sudo systemctl status asterisk
+sudo systemctl restart asterisk
 ```
+
+## High-Level Architecture
+
+### Call Flow
+1. **Inbound Call**: Placetel SIP → Asterisk → Stasis(teli24-voice-ai)
+2. **ARI Processing**: StasisStart → Create SnoopChannel + External Media
+3. **Audio Pipeline**: 
+   - Caller → SnoopChannel → RTP → STT → AI → TTS → RTP → External Media → Caller
+4. **Recording**: Real-time transcription + MP3 recording saved to database
+
+### Port Allocation
+- **5060**: SIP signaling
+- **8088**: Asterisk HTTP/WebSocket (ARI)
+- **8080**: Teli24 Middleware API
+- **15000-16000**: RTP audio streams (500 port pairs)
+- **5432**: PostgreSQL database
+
+### Audio Processing
+- **Inbound**: G.711 μ-law/A-law → 16kHz PCM for STT
+- **Outbound**: 24kHz synthesis → 8kHz G.711 for telephony
+- **VAD**: Voice Activity Detection with 400-800ms silence threshold
+- **Jitter Buffer**: Handles ±40ms network variation
 
 ## Critical Implementation Notes
 
-### RTP Stream Management
+### ✅ Current Architecture: SnoopChannel + External Media
+The system uses a hybrid approach:
+- **SnoopChannel**: Captures caller audio (unidirectional, no echo)
+- **External Media**: Plays AI responses back to caller
+- **Benefits**: No feedback loops, industry-standard approach
 
-#### Connection Establishment
-1. Asterisk calls ExternalMedia() in dialplan
-2. HTTP POST to our server with channel info
-3. We respond with RTP endpoint details
-4. Asterisk establishes bidirectional RTP stream
+### ❌ Avoid These Patterns
+- **AudioSocket**: Experimental, unstable, TCP-based (never use)
+- **Bidirectional External Media**: Causes feedback and echo
+- **Direct RTP binding on Server 7**: Causes port conflicts
 
-#### Stream Characteristics
-- **Continuous flow**: 50 packets/second (20ms each)
-- **Jitter buffer**: Handle ±40ms variation
-- **Packet loss**: Tolerate up to 3% loss
-- **DTMF**: RFC 4733 events or inband
-- **Comfort noise**: During silence periods
+### Database Schema
+Key tables:
+- `Assistant`: AI assistant configurations
+- `PhoneNumber`: Phone number to assistant mapping
+- `CallRecord`: Call metadata and recordings
+- `CallTranscript`: Real-time conversation transcripts
+- `CallRecording`: MP3 audio files
 
-### Voice Activity Detection (VAD)
-- Energy threshold: 200-300 for 8kHz audio
-- Minimum speech: 300-500ms
-- End-of-speech silence: 400-800ms
-- Buffer management: Keep max 10 seconds, process incrementally
-
-### Latency Optimization
-- Use `mistral-small-latest` for <200ms AI responses
-- Stream TTS chunks as they generate (don't wait for full synthesis)
-- Process STT immediately on silence detection
-- Target total latency: <600ms user-to-response
-
-## CURRENT PROBLEM STATUS
-
-### Problem: "legt sofort auf!" (Hangs up immediately)
-**Status**: UNRESOLVED - Call drops immediately when dialing 4920189098723
-
-**Root Cause Analysis**:
-1. AudioSocket is fundamentally unstable for production use
-2. ExternalMedia in Asterisk 22 works via ARI REST API, not as dialplan application
-3. ARI WebSocket connection established but Stasis events not triggering properly
-4. Dialplan routes to Stasis(voice-ai) but connection drops before processing
-
-**Attempted Solutions**:
-1. ❌ AudioSocket with various keep-alive mechanisms - unstable, drops after 2-3 responses
-2. ❌ Direct ExternalMedia() in dialplan - not supported in Asterisk 22
-3. ⚠️ ARI with Stasis app - partially working, WebSocket connects but calls drop
-4. ⚠️ RTP External Media via ARI - implemented but not fully tested
-
-## TODO LIST (Priority Order)
-
-### IMMEDIATE (Fix "legt sofort auf!")
-- [ ] Debug why Stasis(voice-ai) causes immediate hangup
-- [ ] Check ARI user permissions in ari.conf
-- [ ] Verify http.conf allows WebSocket connections
-- [ ] Test with simple ARI echo application first
-- [ ] Monitor SIP/RTP traffic during failed calls
-
-### Phase 1: Get Basic Call Working
-- [ ] Establish stable bidirectional audio (any method)
-- [ ] Fix immediate hangup issue
-- [ ] Get greeting to play without dropping
-- [ ] Handle at least 3 conversation turns without dropping
-
-### Phase 2: Stabilization
-- [x] Female voice from database
-- [x] Conversation history/context
-- [ ] Proper error recovery
-- [ ] Connection monitoring
-- [ ] Graceful degradation
-
-### Phase 3: Alternative Solutions
-- [ ] Consider FreeSWITCH instead of Asterisk
-- [ ] Evaluate LiveKit SIP Gateway
-- [ ] Test Jambonz for voice AI
-- [ ] Try Twilio Elastic SIP Trunking with Media Streams
-
-## CRITICAL INSIGHTS
-
-### Why Current Setup Fails
-1. **AudioSocket is not production-ready** - It's experimental and unstable
-2. **Asterisk 22 ExternalMedia** requires full ARI implementation, not simple dialplan
-3. **TCP-based audio (AudioSocket)** has inherent timing issues vs UDP (RTP)
-4. **No proper jitter buffer** in our implementation
-5. **Missing RTCP** for quality control
-
-### What Works in Production (Industry Standard)
-- **Twilio**: Uses Media Streams (WebSocket) with mulaw/alaw
-- **Amazon Connect**: Uses Kinesis Video Streams
-- **Google Cloud**: Uses bidirectional streaming gRPC
-- **Vonage**: Uses WebSocket with RTP
-- **LiveKit**: Uses WebRTC with proper signaling
-
-### Recommended Solution
-**STOP trying to fix AudioSocket** - it will never be stable enough for production.
-**IMPLEMENT** proper ARI with ExternalMedia or switch to a modern platform.
-
-## Testing the RTP Implementation
-
+### Environment Variables
 ```bash
-# 1. Start RTP server
-DB_PASSWORD='BlLNl1jMWpZC9_td5bFVUKgAvtI3LQkW' ./venv/bin/python rtp_voice_ai.py
-
-# 2. Configure Asterisk to use External Media
-asterisk -rx "dialplan reload"
-
-# 3. Make test call
-asterisk -rx "channel originate PJSIP/4920189098723@fpbx application Playback hello-world"
-
-# 4. Monitor RTP packets
-sudo tcpdump -i lo -n udp port 10000 -X
-```
-
-## Environment Configuration
-
-### Required Environment Variables
-```bash
-# Azure Speech Services (Required for production)
-AZURE_SPEECH_KEY=<key>
-AZURE_SPEECH_REGION=germanywestcentral
-
-# Database (PostgreSQL)
+# Database
 DB_HOST=10.0.0.5
 DB_PASSWORD=BlLNl1jMWpZC9_td5bFVUKgAvtI3LQkW
 
-# Mistral AI (Hardcoded in files, should be moved to env)
+# Azure Speech
+AZURE_SPEECH_KEY=<key>
+AZURE_SPEECH_REGION=germanywestcentral
+
+# Mistral AI
 MISTRAL_API_KEY=rbBHVYVpt7Oe2HdUVKNoZLQ7cTilajyb
 ```
 
-### File Locations
-- Python implementations: `/home/admini/asterisk-voice-ai/`
-- Asterisk config: `/etc/asterisk/`
-- Logs: `/var/log/asterisk/messages.log`
-- Virtual environment: `/home/admini/asterisk-voice-ai/venv/`
+## Project Structure
 
-### Dependencies
-```bash
-# Python packages (in venv)
-azure-cognitiveservices-speech
-asyncpg
-aiohttp
-numpy
-python-dotenv
+```
+/home/admini/
+├── asterisk-voice-ai/        # Voice AI implementations
+│   ├── ari_snoop_final.py    # Production ARI bridge
+│   ├── requirements.txt      # Python dependencies
+│   └── venv/                 # Virtual environment
+├── archivalles/
+│   └── teli24-middleware/    # FastAPI middleware service
+│       ├── app/              # Application code
+│       ├── requirements.txt  # Dependencies
+│       └── venv/            # Virtual environment
+└── config/
+    └── asterisk/            # Asterisk configurations
+        ├── pjsip.conf       # SIP settings
+        └── extensions.conf  # Dialplan
 
-# System requirements
-Asterisk 22 LTS (with AudioSocket support)
-Python 3.12+
-PostgreSQL client libraries
+/etc/asterisk/               # System Asterisk config
+├── ari.conf                 # ARI settings
+├── http.conf               # HTTP/WebSocket config
+└── extensions_voice_ai.conf # Voice AI dialplan
 ```
 
-## Specialized Sub-Agents Architecture
+## Troubleshooting Guide
 
-### Available Agents for Voice AI System
+### Common Issues
 
-The following specialized agents have been created to handle different aspects of the Voice AI system:
+**"Anruf wird sofort aufgelegt" (Call drops immediately)**
+- Check ARI WebSocket connection
+- Verify Stasis application is running
+- Check `ari.conf` for correct user/password
+- Monitor with `asterisk -rvvv`
 
-#### 1. **asterisk-config-agent** & **asterisk-config-manager**
-- **Purpose**: Manage Asterisk 22 LTS configuration
-- **Responsibilities**: 
-  - PJSIP/SIP configuration
-  - Dialplan management (extensions.conf)
-  - Module loading and codec negotiation
-  - Registration monitoring
-- **Key Files**: `/etc/asterisk/pjsip.conf`, `/etc/asterisk/extensions*.conf`
+**No audio/Silent calls**
+- Check RTP port allocation (15000-16000)
+- Verify codec negotiation (G.711)
+- Monitor with `tcpdump -i any udp portrange 15000-16000`
 
-#### 2. **ari-bridge-agent**
-- **Purpose**: Handle ARI (Asterisk REST Interface) operations
-- **Responsibilities**:
-  - WebSocket connection management
-  - Stasis application registration
-  - Channel bridging and control
-  - Event subscription handling
-- **Key Commands**: `ari show apps`, ARI REST API calls
+**STT not recognizing speech**
+- Verify audio format (16kHz, 16-bit PCM)
+- Check Azure credentials and region
+- Test VAD sensitivity settings
 
-#### 3. **external-media-rtp**
-- **Purpose**: Implement RTP-based External Media streaming
-- **Responsibilities**:
-  - RTP socket creation and management
-  - Media format negotiation (G.711 μ-law/a-law)
-  - Packet timing (20ms frames)
-  - SSRC and sequence number management
-- **Key Files**: `ari_external_media.py`, `rtp_voice_ai.py`
+**High latency**
+- Use Mistral small model for faster responses
+- Enable TTS streaming
+- Check network between servers
 
-#### 4. **audio-quality-optimizer** & **audio-quality-diagnostics**
-- **Purpose**: Optimize audio pipeline and diagnose quality issues
-- **Responsibilities**:
-  - Audio resampling (8kHz ↔ 16kHz ↔ 24kHz)
-  - Echo cancellation configuration
-  - Jitter buffer optimization
-  - Voice Activity Detection (VAD)
-  - Analyze choppy audio problems
-  - Debug codec mismatches
-- **Key Tools**: sox, ffmpeg, webrtcvad
+## Testing Procedures
 
-#### 5. **stt-tts-integration**
-- **Purpose**: Integrate speech services
-- **Responsibilities**:
-  - Azure Speech Services configuration
-  - Edge-TTS implementation
-  - Streaming synthesis and recognition
-  - Voice selection from database
-- **Key APIs**: Azure Cognitive Services, Edge-TTS
-
-#### 6. **database-assistant-manager**
-- **Purpose**: Manage assistant configurations from database
-- **Responsibilities**:
-  - Query PostgreSQL for assistant settings
-  - Parse voice configurations
-  - Manage conversation history
-  - Handle system prompts
-- **Database**: `teli24_development` on 10.0.0.5
-
-#### 7. **performance-monitor**
-- **Purpose**: Monitor system performance and metrics
-- **Responsibilities**:
-  - Track call setup time
-  - Measure STT/TTS/LLM latency
-  - Monitor concurrent calls
-  - Export Prometheus metrics
-- **Target Metrics**: <600ms E2E latency
-
-#### 8. **debug-troubleshoot-agent**
-- **Purpose**: Debug and troubleshoot issues
-- **Responsibilities**:
-  - Analyze "sofort aufgelegt" (immediate hangup) issues
-  - Debug RTP stream problems
-  - Trace SIP messages
-  - Identify performance bottlenecks
-- **Key Tools**: tcpdump, asterisk CLI, log analysis
-
-### Agent Usage Examples
-
+### Basic Health Check
 ```bash
-# When audio quality is poor
-# Use: audio-quality-optimizer or audio-quality-diagnostics
+# 1. Check all services
+ps aux | grep -E "asterisk|ari_snoop|uvicorn"
 
-# When calls hang up immediately  
-# Use: debug-troubleshoot-agent
+# 2. Verify SIP registration
+asterisk -rx "pjsip show registrations" | grep Registered
 
-# When implementing External Media
-# Use: external-media-rtp + ari-bridge-agent
+# 3. Test database connection
+PGPASSWORD='BlLNl1jMWpZC9_td5bFVUKgAvtI3LQkW' psql -U teli24_user -h 10.0.0.5 -d teli24_development -c "SELECT 1;"
 
-# When configuring Asterisk
-# Use: asterisk-config-agent or asterisk-config-manager
-
-# When integrating STT/TTS
-# Use: stt-tts-integration
-
-# When fetching assistant data
-# Use: database-assistant-manager
-
-# When monitoring performance
-# Use: performance-monitor
+# 4. Check middleware health
+curl http://localhost:8080/api/health
 ```
 
-### Current Agent Tasks
+### End-to-End Call Test
+```bash
+# 1. Start monitoring
+asterisk -rvvv  # In terminal 1
+tail -f /home/admini/asterisk-voice-ai/ari_final.log  # In terminal 2
 
-- **asterisk-config-agent**: Configure PJSIP for stable registration
-- **ari-bridge-agent**: Fix Stasis application immediate hangup
-- **external-media-rtp**: Implement bidirectional RTP streaming
-- **audio-quality-optimizer**: Reduce audio latency to <200ms
-- **debug-troubleshoot-agent**: Solve "wird immer noch sofort aufgelegt" issue
+# 2. Make test call
+asterisk -rx "channel originate PJSIP/4920189098723@fpbx application Playback hello-world"
+
+# 3. Verify in database
+PGPASSWORD='BlLNl1jMWpZC9_td5bFVUKgAvtI3LQkW' psql -U teli24_user -h 10.0.0.5 -d teli24_development \
+  -c "SELECT * FROM \"CallRecord\" WHERE \"startTime\" > NOW() - INTERVAL '5 minutes';"
+```
+
+## Important File Locations
+
+- **Production Voice AI**: `/home/admini/asterisk-voice-ai/ari_snoop_final.py`
+- **Middleware Service**: `/home/admini/archivalles/teli24-middleware/app/main.py`
+- **Asterisk Dialplan**: `/etc/asterisk/extensions_voice_ai.conf`
+- **ARI Config**: `/etc/asterisk/ari.conf`
+- **Systemd Services**: `/etc/systemd/system/teli24-*.service`
+- **Logs**: `/var/log/asterisk/`, `/home/admini/asterisk-voice-ai/*.log`
+
+## Current Status & Known Issues
+
+### ✅ Working (Production Ready!)
+- **Complete Call Flow**: Greeting → Conversation → AI Responses → TTS Playback
+- **STT Recognition**: Optimized for complete sentences (2-second audio chunks)
+- **AI Conversations**: Clean system prompt prevents prompt injection issues
+- **TTS Audio Output**: Bidirectional RTP with μ-law conversion works
+- **SnoopChannel + External Media**: Clean audio capture without feedback
+- **Database Integration**: Call recording, transcripts, assistant configs
+- **Multi-assistant Support**: Dynamic assistant selection by phone number
+
+### 🔧 Recent Critical Fixes (August 2025)
+1. **STT Word Fragmentation** - Fixed audio chunks being too small (1s→2s)
+2. **Prompt Injection Attack** - Replaced massive DB system prompt with clean version
+3. **Audio Timeout Issues** - Optimized STT timeouts for natural speech patterns
+4. **Conversation Flow** - Fixed AttributeError in caller identification
+
+### ⚠️ Monitoring Points
+- **STT Quality**: Monitor for word fragmentation in complex sentences
+- **Response Latency**: Target <2s from speech to TTS playback
+- **Audio Quality**: Check for stuttering or interruptions in TTS output
+
+### 🎯 Optimization Opportunities
+- **Latency Reduction**: Pre-cache common TTS responses
+- **Error Handling**: Better fallbacks for Azure service outages
+- **DTMF Support**: Handle keypad input during conversations
+- **Call Analytics**: Enhanced metrics and conversation insights
